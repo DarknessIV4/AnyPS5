@@ -1,7 +1,7 @@
 name: Sync fork
 on:
   schedule:
-    - cron: '0 */3 * * *'   # every 3 hours
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 permissions:
@@ -13,4 +13,4 @@ jobs:
     steps:
       - run: gh repo sync ${{ github.repository }} -b main
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
