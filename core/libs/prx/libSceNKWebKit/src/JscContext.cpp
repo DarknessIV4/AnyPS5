@@ -1,5 +1,6 @@
 #include "Jsc.hpp"
 #include "prx/libSceNKWebKit/include/JscExports.hpp"
+#include "prx/libSceNKWebKit/include/WtfExports.hpp"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -223,7 +224,8 @@ void CapturePendingException(OpaqueJSContext* ctx, JSValueRef* exception) {
         return;
     }
     if (JS_IsUncatchableError(exc)) {
-        JS_ClearUncatchableError(ctx->qctx, exc);
+        JS_FreeValue(ctx->qctx, exc);
+        exc = JS_NewString(ctx->qctx, "JavaScript execution terminated.");
     }
     if (exception) {
         *exception = ctx->group->ToHandle(ctx, exc);
@@ -558,9 +560,30 @@ void OpaqueJSContextGroup::RefreshDeadline() {
 }
 
 void OpaqueJSContextGroup::EnterVm() {
-    if (vmEntryDepth++ != 0 || !hasTimeLimit) return;
+    if (vmEntryDepth++ != 0) return;
+    UpdateStackLimit();
+    if (!hasTimeLimit) return;
     RefreshDeadline();
     deadlineArmed = true;
+}
+
+void OpaqueJSContextGroup::UpdateStackLimit() {
+    constexpr std::size_t maxPerThreadStackUsage = 5 * 1024 * 1024;
+    constexpr std::size_t softReservedZoneSize = 128 * 1024;
+    JS_UpdateStackTop(rt);
+    const char marker = 0;
+    const auto start = reinterpret_cast<std::uintptr_t>(&marker);
+    std::uintptr_t bound = 0;
+    try {
+        bound = reinterpret_cast<std::uintptr_t>(_ZN3WTF11StackBounds32currentThreadStackBoundsInternalEv().m_bound);
+    } catch (const std::runtime_error&) {
+        JS_SetMaxStackSize(rt, 0);
+        return;
+    }
+    const std::uintptr_t endWithReservedZone = bound + softReservedZoneSize;
+    const std::size_t available = start > endWithReservedZone ? start - endWithReservedZone : 0;
+    const std::size_t budget = std::min(maxPerThreadStackUsage - softReservedZoneSize, available);
+    JS_SetMaxStackSize(rt, std::max<std::size_t>(budget, 1));
 }
 
 void OpaqueJSContextGroup::ExitVm() {
@@ -626,6 +649,7 @@ OpaqueJSContext::OpaqueJSContext(OpaqueJSContextGroup* grp, OpaqueJSClass* globa
         }
         JS_SetPrototype(qctx, globalObject->qval, globalExoticInterceptor);
 
+        if (globalObjectClass->HasConvertToType()) DefineToPrimitive(this, globalObject->qval, true);
         RunClassInitialize(this, globalObject, globalObjectClass);
     }
 }
