@@ -38,6 +38,18 @@ std::size_t RvaToOffset(const std::vector<std::uint8_t>& pe, std::uint32_t rva, 
     return static_cast<std::size_t>(offset);
 }
 
+std::size_t RvaRangeToOffset(const std::vector<std::uint8_t>& pe, std::uint32_t rva, std::size_t size, std::uint32_t peHeaderOffset, std::uint16_t numberOfSections, std::uint32_t sizeOfOptionalHeader) {
+    const std::size_t sectionOffset = FindSectionOffsetByRva(pe, rva, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
+    const auto section = Internal::Read<PeSectionHeader>(pe, sectionOffset);
+    const auto relative = rva - section.VirtualAddress;
+    if (relative > section.SizeOfRawData || size > section.SizeOfRawData - relative)
+        throw std::runtime_error("rva range exceeds section file data");
+    const auto offset = std::uint64_t{section.PointerToRawData} + relative;
+    if (offset > pe.size() || size > pe.size() - offset)
+        throw std::runtime_error("rva range exceeds file bounds");
+    return static_cast<std::size_t>(offset);
+}
+
 std::string ReadRvaCStr(const std::vector<std::uint8_t>& pe, std::uint32_t rva, std::uint32_t peHeaderOffset, std::uint16_t numberOfSections, std::uint32_t sizeOfOptionalHeader, std::size_t skip = 0u) {
     const std::size_t sectionOffset = FindSectionOffsetByRva(pe, rva, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
     const auto section = Internal::Read<PeSectionHeader>(pe, sectionOffset);
@@ -293,25 +305,29 @@ void PeNidPatcher::PatchNids(std::vector<std::uint8_t>& pe, const std::string& l
     };
     std::vector<ImportUse> imports;
     std::vector<std::string> importNames;
-    std::size_t importDescOffset = RvaToOffset(pe, importDir.VirtualAddress, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
+    std::size_t importDescOffset = RvaRangeToOffset(pe, importDir.VirtualAddress, importDir.Size, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
+    const std::size_t importDescEnd = importDescOffset + importDir.Size;
+    bool foundNullImportDescriptor = false;
 
-    while (true) {
-        if (importDescOffset + sizeof(PeImportDescriptor) > pe.size())
-            throw std::runtime_error("import descriptor out of bounds");
-
+    while (importDescOffset <= importDescEnd && sizeof(PeImportDescriptor) <= importDescEnd - importDescOffset) {
         const auto desc = Read<PeImportDescriptor>(pe, importDescOffset);
-        if (desc.OriginalFirstThunk == 0u && desc.FirstThunk == 0u)
+        if (desc.OriginalFirstThunk == 0u && desc.FirstThunk == 0u) {
+            foundNullImportDescriptor = true;
             break;
+        }
 
         const std::uint32_t thunkRva = desc.OriginalFirstThunk != 0u ? desc.OriginalFirstThunk : desc.FirstThunk;
         std::size_t thunkOffset = RvaToOffset(pe, thunkRva, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
+        const auto thunkSectionOffset = FindSectionOffsetByRva(pe, thunkRva, peHeaderOffset, numberOfSections, sizeOfOptionalHeader);
+        const auto thunkSection = Internal::Read<PeSectionHeader>(pe, thunkSectionOffset);
+        const auto thunkRawEnd = std::uint64_t{thunkSection.PointerToRawData} + thunkSection.SizeOfRawData;
 
         const bool is64 = magic == 0x20bu;
         const std::size_t thunkEntrySize = is64 ? 8u : 4u;
         const std::uint64_t ordinalFlag = is64 ? (std::uint64_t{1} << 63u) : (std::uint64_t{1} << 31u);
 
         while (true) {
-            if (thunkOffset + thunkEntrySize > pe.size())
+            if (thunkOffset > thunkRawEnd || thunkEntrySize > thunkRawEnd - thunkOffset || thunkOffset > pe.size() || thunkEntrySize > pe.size() - thunkOffset)
                 throw std::runtime_error("thunk entry out of bounds");
 
             const std::uint64_t thunk = is64
@@ -340,6 +356,8 @@ void PeNidPatcher::PatchNids(std::vector<std::uint8_t>& pe, const std::string& l
 
         importDescOffset += sizeof(PeImportDescriptor);
     }
+    if (!foundNullImportDescriptor)
+        throw std::runtime_error("import descriptor table is not terminated within import directory");
     const auto importMap = ResolveImportNids(importNames, excludedExports, options);
     const auto fitsInPlace = [&](const ImportUse& item) {
         return !options.executable && importMap.at(item.Name).size() <= item.Name.size();
